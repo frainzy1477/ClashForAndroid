@@ -1,194 +1,127 @@
 package com.github.kr328.clash.core
 
-import android.content.Context
-import android.net.LocalSocket
-import com.github.kr328.clash.core.event.BandwidthEvent
+import android.os.ParcelFileDescriptor
+import com.github.kr328.clash.common.Global
+import com.github.kr328.clash.common.utils.Log
+import com.github.kr328.clash.core.bridge.Bridge
+import com.github.kr328.clash.core.bridge.TunCallback
 import com.github.kr328.clash.core.event.LogEvent
-import com.github.kr328.clash.core.event.ProcessEvent
-import com.github.kr328.clash.core.event.SpeedEvent
-import com.github.kr328.clash.core.model.*
-import com.github.kr328.clash.core.utils.Log
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonConfiguration
-import kotlinx.serialization.stringify
+import com.github.kr328.clash.core.model.General
+import com.github.kr328.clash.core.model.ProxyGroup
+import com.github.kr328.clash.core.model.Traffic
 import java.io.File
-import java.io.FileDescriptor
-import java.io.IOException
+import java.io.InputStream
+import java.util.concurrent.CompletableFuture
 
-class Clash(
-    context: Context,
-    clashDir: File,
-    controllerPath: File,
-    listener: (ProcessEvent) -> Unit
-) : BaseClash(controllerPath) {
-    companion object {
-        const val COMMAND_PING = 0
-        const val COMMAND_TUN_START = 1
-        const val COMMAND_TUN_STOP = 2
-        const val COMMAND_PROFILE_RELOAD = 4
-        const val COMMAND_QUERY_PROXIES = 5
-        const val COMMAND_PULL_SPEED = 6
-        const val COMMAND_PULL_LOG = 7
-        const val COMMAND_PULL_BANDWIDTH = 8
-        const val COMMAND_SET_PROXY = 9
-        const val COMMAND_QUERY_GENERAL = 10
-        const val COMMAND_URL_TEST = 11
+object Clash {
+    private val logReceivers = mutableMapOf<String, (LogEvent) -> Unit>()
 
-        const val PING_REPLY = 233
+    init {
+        val context = Global.application
 
-        const val DEFAULT_URL_TEST_TIMEOUT = 5000
-        const val DEFAULT_URL_TEST_URL = "https://www.gstatic.com/generate_204"
-    }
+        val bytes = context.assets.open("Country.mmdb")
+            .use(InputStream::readBytes)
 
-    val process = ClashProcess(context, clashDir, controllerPath, listener)
+        Bridge.initialize(bytes, context.cacheDir.absolutePath, BuildConfig.VERSION_NAME)
+        Bridge.reset()
 
-    fun ping(): Boolean {
-        return runControlNoException(COMMAND_PING) { _, input, _ ->
-            input.readInt() == PING_REPLY
-        } ?: false
-    }
-
-    fun loadProfile(file: File, selected: Map<String, String>): List<String> {
-        return runControl(COMMAND_PROFILE_RELOAD) { _, input, output ->
-            output.writeString(
-                Json(JsonConfiguration.Stable)
-                    .stringify(
-                        LoadProfilePacket.Request.serializer(),
-                        LoadProfilePacket.Request(file.absolutePath, selected)
-                    )
-            )
-
-            val result = Json(JsonConfiguration.Stable)
-                .parse(LoadProfilePacket.Response.serializer(), input.readString())
-
-            if (result.error.isNotEmpty()) {
-                throw IOException(result.error)
-            }
-
-            return@runControl result.invalidSelected
-        }
-    }
-
-    fun queryGeneral(): GeneralPacket {
-        return runCatching {
-            runControl(COMMAND_QUERY_GENERAL) { _, input, _ ->
-                Json(JsonConfiguration.Stable).parse(GeneralPacket.serializer(), input.readString())
-            }
-        }.getOrDefault(
-            GeneralPacket(
-                GeneralPacket.Ports(0, 0, 0, 0),
-                GeneralPacket.Mode.DIRECT
-            )
-        )
-    }
-
-    fun queryProxies(): RawProxyPacket {
-        return runControl(COMMAND_QUERY_PROXIES) { _, input, _ ->
-            val data = input.readString()
-
-            Json(JsonConfiguration.Stable.copy(strictMode = false))
-                .parse(RawProxyPacket.serializer(), data)
-        }
-    }
-
-    fun setSelectProxy(key: String, value: String) {
-        runControl(COMMAND_SET_PROXY) { _, input, output ->
-            output.writeString(
-                Json(JsonConfiguration.Stable)
-                    .stringify(
-                        SetProxyPacket.Request.serializer(),
-                        SetProxyPacket.Request(key, value)
-                    )
-            )
-
-            val response = Json(JsonConfiguration.Stable).parse(
-                SetProxyPacket.Response.serializer(),
-                input.readString()
-            )
-
-            if (response.error.isNotEmpty())
-                throw IOException(response.error)
-        }
-    }
-
-    fun pullSpeedEvent(initial: (LocalSocket) -> Unit, callback: (SpeedEvent) -> Unit) {
-        runControlNoException(COMMAND_PULL_SPEED) { socket, input, _ ->
-            initial(socket)
-
-            while (!Thread.currentThread().isInterrupted) {
-                callback(
-                    Json(JsonConfiguration.Stable).parse(
-                        SpeedEvent.serializer(),
-                        input.readString()
-                    )
-                )
-            }
-        }
-    }
-
-    fun pullLogsEvent(initial: (LocalSocket) -> Unit, callback: (LogEvent) -> Unit) {
-        runControlNoException(COMMAND_PULL_LOG) { socket, input, _ ->
-            initial(socket)
-
-            while (!Thread.currentThread().isInterrupted) {
-                callback(
-                    Json(JsonConfiguration.Stable).parse(
-                        LogEvent.serializer(),
-                        input.readString()
-                    )
-                )
-            }
-        }
-    }
-
-    fun pullBandwidthEvent(initial: (LocalSocket) -> Unit, callback: (BandwidthEvent) -> Unit) {
-        runControlNoException(COMMAND_PULL_BANDWIDTH) { socket, input, _ ->
-            initial(socket)
-
-            while (!Thread.currentThread().isInterrupted) {
-                callback(
-                    Json(JsonConfiguration.Stable).parse(
-                        BandwidthEvent.serializer(),
-                        input.readString()
-                    )
-                )
-            }
-        }
-    }
-
-    fun startUrlTest(proxies: List<String>, callback: (String, Long) -> Unit) {
-        runControl(COMMAND_URL_TEST) { _, input, output ->
-            output.writeString(Json(JsonConfiguration.Stable)
-                .stringify(UrlTestPacket.Request.serializer(),
-                    UrlTestPacket.Request(proxies, DEFAULT_URL_TEST_TIMEOUT, DEFAULT_URL_TEST_URL)))
-
-            while ( true ) {
-                val data = input.readString()
-                if ( data.isEmpty() )
-                    return@runControl
-
-                val response = Json(JsonConfiguration.Stable)
-                    .parse(UrlTestPacket.Response.serializer(), data)
-
-                callback(response.name, response.delay)
+        Bridge.setLogCallback {
+            synchronized(logReceivers) {
+                logReceivers.forEach { (_, e) -> e(it) }
             }
         }
 
-        Log.i("Url test exited")
+        Log.i("Clash core initialized")
     }
 
-    fun startTunDevice(fd: FileDescriptor, mtu: Int, dnsHijacking: Boolean) {
-        runControl(COMMAND_TUN_START) { socket, _, output ->
-            socket.setFileDescriptorsForSend(arrayOf(fd))
-            socket.outputStream.write(0)
-            socket.outputStream.flush()
-            output.writeInt(mtu)
-            output.writeInt(if ( dnsHijacking ) 1 else 0)
-            output.writeInt(0x243)
-        }
+    fun start() {
+        Bridge.reset()
+    }
+
+    fun stop() {
+        Bridge.reset()
+    }
+
+    fun startTunDevice(
+        fd: Int,
+        mtu: Int,
+        gateway: String,
+        mirror: String,
+        dns: String,
+        onNewSocket: (Int) -> Boolean,
+        onTunStop: () -> Unit
+    ) {
+        Bridge.startTunDevice(fd, mtu, gateway, mirror, dns, object: TunCallback {
+            override fun onNewSocket(socket: Int) {
+                onNewSocket(socket)
+            }
+            override fun onStop() {
+                onTunStop()
+            }
+        })
     }
 
     fun stopTunDevice() {
-        runControlNoException(COMMAND_TUN_STOP)
+        Bridge.stopTunDevice()
+    }
+
+    fun setDnsOverride(dnsOverride: Boolean, appendNameservers: List<String>) {
+        Bridge.setDnsOverride(dnsOverride, appendNameservers.joinToString(","))
+    }
+
+    fun loadProfile(path: File, baseDir: File): CompletableFuture<Unit> {
+        return Bridge.loadProfile(path.absolutePath, baseDir.absolutePath).thenApply { Unit }
+    }
+
+    fun downloadProfile(url: String, output: File, baseDir: File): CompletableFuture<Unit> {
+        return Bridge.downloadProfile(url, baseDir.absolutePath, output.absolutePath).thenApply { Unit }
+    }
+
+    fun downloadProfile(fd: ParcelFileDescriptor, output: File, baseDir: File): CompletableFuture<Unit> {
+        return Bridge.downloadProfile(fd.detachFd(), baseDir.absolutePath, output.absolutePath).thenApply { Unit }
+    }
+
+    fun queryProxyGroups(): List<ProxyGroup> {
+        return Bridge.queryProxyGroups().toList()
+    }
+
+    fun setSelector(name: String, selected: String): Boolean {
+        return Bridge.setSelector(name, selected)
+    }
+
+    fun performHealthCheck(group: String): CompletableFuture<Unit> {
+        return Bridge.performHealthCheck(group).thenApply { Unit }
+    }
+
+    fun setProxyMode(mode: String) {
+        Bridge.setProxyMode(mode)
+    }
+
+    fun queryGeneral(): General {
+        return Bridge.queryGeneral()
+    }
+
+    fun querySpeed(): Traffic {
+        return Bridge.querySpeed()
+    }
+
+    fun queryBandwidth(): Traffic {
+        return Bridge.queryBandwidth()
+    }
+
+    fun registerLogReceiver(key: String, receiver: (LogEvent) -> Unit) {
+        synchronized(logReceivers) {
+            if ( logReceivers.isEmpty() )
+                Bridge.enableLogReport()
+            logReceivers[key] = receiver
+        }
+    }
+
+    fun unregisterLogReceiver(key: String) {
+        synchronized(logReceivers) {
+            logReceivers.remove(key)
+            if ( logReceivers.isEmpty() )
+                Bridge.disableLogReport();
+        }
     }
 }
